@@ -1,0 +1,3 @@
+# Project exclude paths
+/kafka-consumer/target/
+/kafka-producer/target/
