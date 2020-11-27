@@ -357,6 +357,192 @@ kafkaProducer.kafkaTemplate.send("topic-test",message);
 
 ## srping-kafka的原理剖析
 
+[源码地址](https://github.com/spring-projects/spring-kafka)
+
+* 1 首先执行org.springframework.kafka.annotation.KafkaListenerAnnotationBeanPostProcessor.postProcessAfterInitialization方法,
+这个方法主要是扫描所有注解@KafkaListener的类或者方法，将注解内的信息封装到了KafkaListenerEndpointDescriptor，并将KafkaListenerEndpointDescriptor
+放入org.springframework.kafka.config.KafkaListenerEndpointRegistrar的集合变量org.springframework.kafka.config.KafkaListenerEndpointRegistrar.endpointDescriptors
+进行维护.
+
+* 2 执行org.springframework.kafka.config.KafkaListenerEndpointRegistrar类的org.springframework.kafka.config.KafkaListenerEndpointRegistrar.afterPropertiesSet()
+这个方法主要是遍历所有的org.springframework.kafka.config.KafkaListenerEndpointRegistrar.endpointDescriptors并且为每个org.springframework.kafka.config.KafkaListenerEndpointRegistrar.endpointDescriptors
+生产一个MessageListenerContainer
+
+
+* 3 由于KafkaMessageListenerConatainer间接的实现了Leftcycle接口，所以start(),在这异步还创建了ListnerConsumer对象，该类实现了Runnable接口，实例化一个KafkaConsumer对象.
+
+```text
+	@Override
+	public final void start() {
+		checkGroupId();
+		synchronized (this.lifecycleMonitor) {
+			if (!isRunning()) {
+				Assert.state(this.containerProperties.getMessageListener() instanceof GenericMessageListener,
+						() -> "A " + GenericMessageListener.class.getName() + " implementation must be provided");
+				doStart();
+			}
+		}
+	}
+------------------------------------------------------------------------------------------------------------------------
+@Override
+	protected void doStart() {
+		if (isRunning()) {
+			return;
+		}
+		if (this.clientIdSuffix == null) { // stand-alone container
+			checkTopics();
+		}
+		ContainerProperties containerProperties = getContainerProperties();
+		checkAckMode(containerProperties);
+
+		Object messageListener = containerProperties.getMessageListener();
+		if (containerProperties.getConsumerTaskExecutor() == null) {
+			SimpleAsyncTaskExecutor consumerExecutor = new SimpleAsyncTaskExecutor(
+					(getBeanName() == null ? "" : getBeanName()) + "-C-");
+			containerProperties.setConsumerTaskExecutor(consumerExecutor);
+		}
+		GenericMessageListener<?> listener = (GenericMessageListener<?>) messageListener;
+		ListenerType listenerType = determineListenerType(listener);
+		this.listenerConsumer = new ListenerConsumer(listener, listenerType);
+		setRunning(true);
+		this.startLatch = new CountDownLatch(1);
+		this.listenerConsumerFuture = containerProperties
+				.getConsumerTaskExecutor()
+				.submitListenable(this.listenerConsumer);
+		try {
+			if (!this.startLatch.await(containerProperties.getConsumerStartTimout().toMillis(), TimeUnit.MILLISECONDS)) {
+				this.logger.error("Consumer thread failed to start - does the configured task executor "
+						+ "have enough threads to support all containers and concurrency?");
+				publishConsumerFailedToStart();
+			}
+		}
+		catch (@SuppressWarnings(UNUSED) InterruptedException e) {
+			Thread.currentThread().interrupt();
+		}
+	}
+
+
+
+```
+
+
+* 4 启动好ListenerConsumer线程，run()中调用了KafkaConsumer的poll()，实现了对消息的拉取.
+```text
+	public void run() { // NOSONAR complexity
+			ListenerUtils.setLogOnlyMetadata(this.containerProperties.isOnlyLogRecordMetadata());
+			publishConsumerStartingEvent();
+			this.consumerThread = Thread.currentThread();
+			setupSeeks();
+			KafkaUtils.setConsumerGroupId(this.consumerGroupId);
+			this.count = 0;
+			this.last = System.currentTimeMillis();
+			initAssignedPartitions();
+			publishConsumerStartedEvent();
+			Throwable exitThrowable = null;
+			while (isRunning()) {
+				try {
+					pollAndInvoke();
+				}
+				catch (@SuppressWarnings(UNUSED) WakeupException e) {
+					// Ignore, we're stopping or applying immediate foreign acks
+				}
+				catch (NoOffsetForPartitionException nofpe) {
+					this.fatalError = true;
+					ListenerConsumer.this.logger.error(nofpe, "No offset and no reset policy");
+					exitThrowable = nofpe;
+					break;
+				}
+				catch (AuthorizationException ae) {
+					if (this.authorizationExceptionRetryInterval == null) {
+						ListenerConsumer.this.logger.error(ae, "Authorization Exception and no authorizationExceptionRetryInterval set");
+						this.fatalError = true;
+						exitThrowable = ae;
+						break;
+					}
+					else {
+						ListenerConsumer.this.logger.error(ae, "Authorization Exception, retrying in " + this.authorizationExceptionRetryInterval.toMillis() + " ms");
+						// We can't pause/resume here, as KafkaConsumer doesn't take pausing
+						// into account when committing, hence risk of being flooded with
+						// GroupAuthorizationExceptions.
+						// see: https://github.com/spring-projects/spring-kafka/pull/1337
+						sleepFor(this.authorizationExceptionRetryInterval);
+					}
+				}
+				catch (FencedInstanceIdException fie) {
+					this.fatalError = true;
+					ListenerConsumer.this.logger.error(fie, "'" + ConsumerConfig.GROUP_INSTANCE_ID_CONFIG
+							+ "' has been fenced");
+					exitThrowable = fie;
+					break;
+				}
+				catch (StopAfterFenceException e) {
+					this.logger.error(e, "Stopping container due to fencing");
+					stop(false);
+					exitThrowable = e;
+				}
+				catch (Error e) { // NOSONAR - rethrown
+					Runnable runnable = KafkaMessageListenerContainer.this.emergencyStop;
+					if (runnable != null) {
+						runnable.run();
+					}
+					this.logger.error(e, "Stopping container due to an Error");
+					wrapUp(e);
+					throw e;
+				}
+				catch (Exception e) {
+					handleConsumerException(e);
+				}
+			}
+			wrapUp(exitThrowable);
+		}
+
+------------------------------------------------------------------------------------------------------------------------
+		protected void pollAndInvoke() {
+			if (!this.autoCommit && !this.isRecordAck) {
+				processCommits();
+			}
+			fixTxOffsetsIfNeeded();
+			idleBetweenPollIfNecessary();
+			if (this.seeks.size() > 0) {
+				processSeeks();
+			}
+			pauseConsumerIfNecessary();
+			this.lastPoll = System.currentTimeMillis();
+			if (!isRunning()) {
+				return;
+			}
+			this.polling.set(true);
+			ConsumerRecords<K, V> records = doPoll();
+			if (!this.polling.compareAndSet(true, false) && records != null) {
+				/*
+				 * There is a small race condition where wakeIfNecessary was called between
+				 * exiting the poll and before we reset the boolean.
+				 */
+				if (records.count() > 0) {
+					this.logger.debug(() -> "Discarding polled records, container stopped: " + records.count());
+				}
+				return;
+			}
+			resumeConsumerIfNeccessary();
+			debugRecords(records);
+			if (records != null && records.count() > 0) {
+				savePositionsIfNeeded(records);
+				notIdle();
+				invokeListener(records);
+			}
+			else {
+				checkIdle();
+			}
+		}
+```
+
+
+
+
+
+
+
+
 
 
 
